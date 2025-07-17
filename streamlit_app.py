@@ -6,6 +6,7 @@ Uses stored procedures instead of direct API calls.
 OPTIMIZED VERSION FOR FASTER RESPONSE TIMES
 All data sources now use the unified Dremio procedure.
 ENHANCED: Added timestamp conversion for Salesforce date fields
+FIXED: Removed automatic procedure calls that were consuming credits
 """
 import json
 import time
@@ -117,7 +118,7 @@ def detect_and_convert_timestamps(df: pd.DataFrame) -> pd.DataFrame:
                         timestamp_ms = int(float(value))
                         if 1000000000000 <= timestamp_ms <= 4102444800000:  # Reasonable range
                             timestamp_s = timestamp_ms / 1000
-                            return datetime.fromtimestamp(timestamp_s).strftime('%Y-%m-%d)
+                            return datetime.fromtimestamp(timestamp_s).strftime('%Y-%m-%d')
                         else:
                             return value
                     except (ValueError, TypeError, OSError):
@@ -141,10 +142,22 @@ def main():
     
     show_header_and_sidebar()
     
-    # Show initial question only once
-    if len(st.session_state.messages) == 0 and st.session_state.selected_yaml and "initial_question_asked" not in st.session_state:
-        st.session_state.initial_question_asked = True
-        process_user_input("What questions can I ask?")
+    # FIXED: Show welcome message without calling the procedure
+    # This prevents automatic credit consumption on app load
+    if len(st.session_state.messages) == 0 and "welcome_shown" not in st.session_state:
+        st.session_state.welcome_shown = True
+        # Add a welcome message to the conversation without calling the API
+        welcome_message = {
+            "role": "analyst",
+            "content": [
+                {
+                    "type": "text", 
+                    "text": f"👋 Welcome to AI Analyst! I'm ready to help you analyze your **{st.session_state.selected_yaml}** data.\n\n💡 **You can ask questions like:**\n- Show me recent sales data\n- What are the top performing products?\n- Display customer analytics\n- Show me monthly trends\n\n✨ Just type your question below to get started!"
+                }
+            ],
+            "request_id": "welcome"
+        }
+        st.session_state.messages.append(welcome_message)
     
     display_conversation()
     handle_user_inputs()
@@ -156,8 +169,11 @@ def reset_session_state():
     st.session_state.messages = []
     st.session_state.active_suggestion = None
     st.session_state.warnings = []
+    # Clean up old state variables
     if "initial_question_asked" in st.session_state:
         del st.session_state.initial_question_asked
+    if "welcome_shown" in st.session_state:
+        del st.session_state.welcome_shown
 
 
 def show_header_and_sidebar():
@@ -183,8 +199,11 @@ def show_header_and_sidebar():
             st.session_state.active_suggestion = None
             st.session_state.warnings = []
             st.session_state.selected_yaml = new_yaml_selection
+            # Clean up old state variables
             if "initial_question_asked" in st.session_state:
                 del st.session_state.initial_question_asked
+            if "welcome_shown" in st.session_state:
+                del st.session_state.welcome_shown
     
     st.info(f"📊 **{st.session_state.selected_yaml}** data source")
     st.divider()
@@ -396,9 +415,7 @@ def modify_salesforce_query(sql: str) -> str:
 def execute_data_procedure(query: str, data_source: str) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
     """
     Execute data procedure with caching and optimized error handling.
-    OPTIMIZED: Added caching and better error messages.
-    All data sources now use the unified Dremio procedure.
-    ENHANCED: Added timestamp conversion for Salesforce data.
+    ENHANCED: Better error handling for user-friendly messages.
     """
     try:
         # All data sources use the same unified Dremio procedure
@@ -408,12 +425,39 @@ def execute_data_procedure(query: str, data_source: str) -> Tuple[Optional[pd.Da
         elif data_source == "Odoo":
             procedure_call = f"CALL SALESFORCE_DREMIO.SALESFORCE_SCHEMA_DREMIO.dremio_data_procedure('{query}')"
         elif data_source == "SAP":
-            # SAP also uses the same unified Dremio procedure
             procedure_call = f"CALL SALESFORCE_DREMIO.SALESFORCE_SCHEMA_DREMIO.dremio_data_procedure('{query}')"
         else:
             return None, f"❌ Unknown data source: {data_source}"
         
-        df = session.sql(procedure_call).to_pandas()
+        # Execute the procedure
+        result = session.sql(procedure_call)
+        
+        # Convert to pandas DataFrame
+        df = result.to_pandas()
+        
+        # Check if df is None or empty
+        if df is None:
+            return None, "⚠️ Data is not available right now. Please try again later or contact your administrator."
+        
+        # Check if the result is actually an error message (string) instead of DataFrame
+        if isinstance(df, str):
+            return None, "⚠️ Data is not available right now. Please try again later or contact your administrator."
+        
+        # Check if DataFrame is empty
+        if df.empty:
+            return None, "📭 No records found for your query. Please try with different criteria."
+        
+        # Check for error columns in the DataFrame (like ERROR, RECEIVED_TYPE, DATA columns in your image)
+        if 'ERROR' in df.columns or 'RECEIVED_TYPE' in df.columns:
+            # This means the procedure returned an error in DataFrame format
+            return None, "⚠️ Data is not available right now. Please try again later or contact your administrator."
+        
+        # Check if the DataFrame contains error-like data
+        if len(df.columns) >= 3 and any(col.upper() in ['ERROR', 'RECEIVED_TYPE', 'DATA'] for col in df.columns):
+            # Check if the first row contains error information
+            first_row = df.iloc[0] if len(df) > 0 else None
+            if first_row is not None and any(str(val).lower().startswith('error') for val in first_row.values):
+                return None, "⚠️ Data is not available right now. Please try again later or contact your administrator."
         
         # Convert timestamps for Salesforce data
         if data_source == "Salesforce" and df is not None and not df.empty:
@@ -427,54 +471,50 @@ def execute_data_procedure(query: str, data_source: str) -> Tuple[Optional[pd.Da
     except SnowparkSQLException as e:
         error_str = str(e).lower()
         
-        # Check for specific error patterns that indicate missing data
+        # Enhanced error pattern matching
         if any(pattern in error_str for pattern in [
             "syntax error", 
             "unexpected 'month'", 
             "unexpected 'year'",
             "unexpected 'day'",
             "invalid date",
-            "data not available"
+            "data not available",
+            "unexpected data format",
+            "no data found",
+            "empty result",
+            "connection error",
+            "timeout"
         ]):
-            return None, "⚠️ Data not available. Please contact your administrator."
+            return None, "⚠️ Data is not available right now. Please try again later or contact your administrator."
         elif "does not exist" in error_str:
-            error_msg = f"❌ **{data_source} Procedure Not Found**\n\nVerify the procedure exists and you have access."
+            return None, "⚠️ Data is not available right now. Please try again later or contact your administrator."
         elif "access denied" in error_str or "insufficient privileges" in error_str:
-            error_msg = f"❌ **Permission Denied**\n\nInsufficient privileges for {data_source} procedure."
+            return None, "⚠️ Data is not available right now. Please contact your administrator for access."
         else:
-            error_msg = f"❌ **{data_source} Error:** {str(e)}"
+            return None, "⚠️ Data is not available right now. Please try again later or contact your administrator."
             
-        return None, error_msg
-        
     except Exception as e:
-        return None, f"❌ **Unexpected Error:** {str(e)}"
+        # Catch all other exceptions and return user-friendly message
+        return None, "⚠️ Data is not available right now. Please try again later or contact your administrator."
 
 
 def display_sql_confidence(confidence: dict):
     """Display SQL confidence information."""
     if confidence is None:
         return
-        
+
     verified_query_used = confidence.get("verified_query_used")
-    with st.popover("🔍 Verified Query Info", help="Query verification details"):
-        if verified_query_used is None:
-            return
-            
-        st.write(f"**Name:** {verified_query_used.get('name', 'N/A')}")
-        st.write(f"**Question:** {verified_query_used.get('question', 'N/A')}")
-        st.write(f"**Verified by:** {verified_query_used.get('verified_by', 'N/A')}")
-        
-        if 'verified_at' in verified_query_used:
-            st.write(f"**Verified at:** {datetime.fromtimestamp(verified_query_used['verified_at'])}")
-        
-        with st.expander("SQL Query"):
-            st.code(verified_query_used.get("sql", "N/A"), language="sql")
+    if verified_query_used is None:
+        return
+
+    # Removed UI display for verified query info
+    # If needed later, you can restore the st.popover block
 
 
 def display_sql_query(sql: str, message_index: int, confidence: dict):
     """
     Display SQL query and execute it via appropriate data procedure.
-    OPTIMIZED: Streamlined display and execution.
+    ENHANCED: Better error handling for user-friendly messages.
     """
     current_data_source = st.session_state.selected_yaml
     
@@ -495,20 +535,11 @@ def display_sql_query(sql: str, message_index: int, confidence: dict):
             df, err_msg = execute_data_procedure(sql, current_data_source)
             
             if df is None:
-                if "Data not available" in err_msg:
-                    st.warning("""
-                    ⚠️ **No Data Available**
-                    
-                    The requested data is not available in the system. 
-                    This could be because:
-                    - The data hasn't been loaded yet
-                    - The time period you requested has no records
-                    - The specific records don't exist
-                    
-                    Please contact your administrator for assistance.
-                    """)
+                # Show user-friendly error message
+                if err_msg:
+                    st.warning(err_msg)
                 else:
-                    st.error(err_msg)
+                    st.warning("⚠️ Data is not available right now. Please try again later or contact your administrator.")
             elif df.empty:
                 st.warning("""
                 📭 **No Records Found**
@@ -517,15 +548,27 @@ def display_sql_query(sql: str, message_index: int, confidence: dict):
                 Try adjusting your filters or time period.
                 """)
             else:
+                # Additional check to make sure df is actually a DataFrame
+                if not isinstance(df, pd.DataFrame):
+                    st.warning("⚠️ Data is not available right now. Please try again later or contact your administrator.")
+                    return
+                
                 # Display results in tabs
                 data_tab, chart_tab = st.tabs(["📄 Data", "📈 Chart"])
                 
                 with data_tab:
-                    st.dataframe(df, use_container_width=True)
-                    st.caption(f"📊 {len(df)} rows returned")
+                    try:
+                        st.dataframe(df, use_container_width=True)
+                        st.caption(f"📊 {len(df)} rows returned")
+                    except Exception as display_error:
+                        st.warning("⚠️ Data is not available right now. Please try again later or contact your administrator.")
+                        return
 
                 with chart_tab:
-                    display_charts_tab(df, message_index)
+                    try:
+                        display_charts_tab(df, message_index)
+                    except Exception as chart_error:
+                        st.warning("⚠️ Chart display is not available right now. Please try again later.")
 
 
 def display_charts_tab(df: pd.DataFrame, message_index: int) -> None:
