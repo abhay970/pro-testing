@@ -293,7 +293,7 @@ def get_analyst_response(messages: List[Dict]) -> Tuple[Dict, Optional[str]]:
     try:
         # Call stored procedure with timeout handling
         result = session.call(
-            "CORTEX_ANALYST.CORTEX_AI.CORTEX_ANALYST_API_PROCEDURE",
+            "CORTEX_ANALYST.CORTEX_AI.CORTEX_ANALYST_API_PROCEDURESSS",
             messages,
             semantic_model_file
         )
@@ -346,7 +346,7 @@ def get_analyst_response(messages: List[Dict]) -> Tuple[Dict, Optional[str]]:
 {str(e)}
 
 💡 **Check:**
-- Procedure exists: `CORTEX_ANALYST.CORTEX_AI.CORTEX_ANALYST_API_PROCEDURE`
+- Procedure exists: `CORTEX_ANALYST.CORTEX_AI.CORTEX_ANALYST_API_PROCEDURESSS`
 - You have EXECUTE permissions
 - YAML file exists in stage
         """
